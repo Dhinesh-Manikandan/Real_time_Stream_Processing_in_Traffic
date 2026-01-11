@@ -1,6 +1,8 @@
 import json
 import joblib
-import hashlib
+import time
+from datetime import datetime
+
 from pyflink.datastream import StreamExecutionEnvironment
 from pyflink.datastream.connectors.kafka import KafkaSource, KafkaOffsetsInitializer
 from pyflink.common.serialization import SimpleStringSchema
@@ -14,45 +16,44 @@ from pyflink.common.watermark_strategy import WatermarkStrategy
 KAFKA_TOPIC = "traffic-data"
 KAFKA_BROKERS = "kafka:29092"
 MODEL_PATH = "/opt/flink/jobs/rerouting_kmeans.pkl"
-WINDOW_SECONDS = 30
-TOP_K_ALTERNATIVES = 2
 
-# 🔥 MUST MATCH KAFKA PARTITIONS
+WINDOW_SECONDS = 10
+TOP_K_ALTERNATIVES = 2
 NUM_BUCKETS = 3
 
-# ================= STABLE HASH =================
-def stable_bucket(street: str) -> int:
-    return int(hashlib.md5(street.encode()).hexdigest(), 16) % NUM_BUCKETS
+# ================= SPATIAL PARTITION =================
+def spatial_bucket(lat: float, lon: float, grid_size=0.02) -> int:
+    x = int(lat / grid_size)
+    y = int(lon / grid_size)
+    return abs(hash((x, y))) % NUM_BUCKETS
 
 # ================= WINDOW FUNCTION =================
 class MLBasedRerouting(ProcessWindowFunction):
 
-    def open(self, runtime_context):
+    def open(self, ctx):
         bundle = joblib.load(MODEL_PATH)
         self.model = bundle["model"]
         self.scaler = bundle.get("scaler")
         self.cluster_labels = bundle.get("cluster_labels", {})
-        self.subtask = runtime_context.get_index_of_this_subtask()
-        print(f"✅ ML model loaded in subtask {self.subtask}")
+        self.subtask = ctx.get_index_of_this_subtask()
 
     def process(self, key, context, elements):
-        street_stats = {}
+        start = time.time()
 
-        for street, severity in elements:
-            street_stats.setdefault(street, {"sum": 0.0, "count": 0})
-            street_stats[street]["sum"] += severity
-            street_stats[street]["count"] += 1
+        road_stats = {}
+        events = 0
+
+        for street, lat, lon, severity in elements:
+            events += 1
+            road_stats.setdefault(street, {"sum": 0, "count": 0})
+            road_stats[street]["sum"] += severity
+            road_stats[street]["count"] += 1
 
         streets, loads = [], []
-
-        for street, stats in street_stats.items():
-            avg = stats["sum"] / stats["count"]
-            load = avg * stats["count"]
-            streets.append(street)
+        for s, v in road_stats.items():
+            load = (v["sum"] / v["count"]) * v["count"]
+            streets.append(s)
             loads.append([load])
-
-        if not streets:
-            return
 
         if self.scaler:
             loads = self.scaler.transform(loads)
@@ -62,31 +63,31 @@ class MLBasedRerouting(ProcessWindowFunction):
         enriched = list(zip(streets, loads, clusters))
         sorted_by_load = sorted(enriched, key=lambda x: x[1][0])
 
+        # ===== Decisions =====
         for street, load, cluster in enriched:
             label = self.cluster_labels.get(cluster, "UNKNOWN")
 
             if label == "HIGH":
-                alternatives = [
-                    s for s, l, c in sorted_by_load if s != street
-                ][:TOP_K_ALTERNATIVES]
-
-                yield (
-                    f"[Subtask-{self.subtask}] 🚨 HIGH | {street} | "
-                    f"Load={load[0]:.2f} | Reroute → {', '.join(alternatives)}"
-                )
+                alts = [s for s, _, _ in sorted_by_load if s != street][:TOP_K_ALTERNATIVES]
+                yield f"[Subtask-{self.subtask}] 🚨 HIGH | {street} | Load={load[0]:.2f} | Reroute → {', '.join(alts)}"
 
             elif label == "MEDIUM":
-                yield (
-                    f"[Subtask-{self.subtask}] ⚠️ MEDIUM | {street} | "
-                    f"Load={load[0]:.2f}"
-                )
+                yield f"[Subtask-{self.subtask}] ⚠️ MEDIUM | {street} | Load={load[0]:.2f}"
 
             else:
-                yield (
-                    f"[Subtask-{self.subtask}] 🟢 LOW | {street} | "
-                    f"Load={load[0]:.2f}"
-                )
+                yield f"[Subtask-{self.subtask}] 🟢 LOW | {street} | Load={load[0]:.2f}"
 
+        latency = time.time() - start
+
+        yield (
+            f"\n📊 METRICS | Subtask-{self.subtask} | "
+            f"Window={datetime.fromtimestamp(context.window().start/1000)} → "
+            f"{datetime.fromtimestamp(context.window().end/1000)}\n"
+            f"   Events Processed   : {events}\n"
+            f"   Unique Roads       : {len(road_stats)}\n"
+            f"   Processing Latency : {latency:.3f} sec\n"
+            f"   Throughput         : {events/WINDOW_SECONDS:.2f} events/sec\n"
+        )
 
 # ================= MAIN =================
 def main():
@@ -101,37 +102,27 @@ def main():
         .set_value_only_deserializer(SimpleStringSchema()) \
         .build()
 
-    stream = env.from_source(
-        source,
-        WatermarkStrategy.no_watermarks(),
-        "Kafka Source"
-    )
+    stream = env.from_source(source, WatermarkStrategy.no_watermarks(), "Kafka")
 
-    def normalize_event(x):
-        try:
-            d = json.loads(x)
-            street = d.get("Street") or d.get("street")
-            severity = d.get("Severity") or d.get("severity")
-            if street is None or severity is None:
-                return None
-            return (street, float(severity))
-        except:
-            return None
+    def normalize(x):
+        d = json.loads(x)
+        return (
+            d["Street"],
+            float(d["Start_Lat"]),
+            float(d["Start_Lng"]),
+            float(d["Severity"])
+        )
 
-    traffic = (
-        stream
-        .map(normalize_event, Types.TUPLE([Types.STRING(), Types.FLOAT()]))
-        .filter(lambda x: x is not None)
-    )
-
-    traffic \
-        .key_by(lambda x: stable_bucket(x[0]), Types.INT()) \
+    stream \
+        .map(normalize, Types.TUPLE([
+            Types.STRING(), Types.FLOAT(), Types.FLOAT(), Types.FLOAT()
+        ])) \
+        .key_by(lambda x: spatial_bucket(x[1], x[2]), Types.INT()) \
         .window(TumblingProcessingTimeWindows.of(Time.seconds(WINDOW_SECONDS))) \
         .process(MLBasedRerouting(), Types.STRING()) \
-        .print() \
-        .set_parallelism(NUM_BUCKETS)
+        .print()
 
-    env.execute("Parallel ML-Based Traffic Rerouting")
+    env.execute("Spatially-Aware ML Traffic Rerouting")
 
 if __name__ == "__main__":
     main()
